@@ -28,7 +28,7 @@ def is_valid_instagram_url(url: str) -> bool:
 
 def run_ytdlp(url: str) -> dict:
     cmd = [
-        "yt-dlp",
+        "python", "-m", "yt_dlp",
         "--dump-json",
         "--no-playlist",
         "--no-warnings",
@@ -144,7 +144,7 @@ def cookies_status():
 @app.get("/health")
 def health():
     try:
-        result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
+        result = subprocess.run(["python", "-m", "yt_dlp", "--version"], capture_output=True, text=True)
         version = result.stdout.strip()
     except FileNotFoundError:
         version = "NOT INSTALLED ❌"
