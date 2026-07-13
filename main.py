@@ -3,12 +3,12 @@ import json
 import re
 import os
 import uuid
-import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import FileResponse
+from fastapi.background import BackgroundTasks
 
-app = FastAPI(title="Insta Reel Downloader", version="3.0.0")
+app = FastAPI(title="Insta Reel Downloader", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,11 +18,14 @@ app.add_middleware(
 )
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
-TMP_DIR = "/tmp/insta-dl"
+TMP_DIR      = "/tmp/insta-dl"
+HOME_BIN     = os.path.join(os.path.expanduser("~"), "bin")
+FFMPEG_PATH  = os.path.join(HOME_BIN, "ffmpeg")
+
 os.makedirs(TMP_DIR, exist_ok=True)
 
 INSTAGRAM_REGEX = re.compile(
-    r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/[\w-]+/?(\?.*)?$"
+    r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/[\w\-]+/?(\?.*)?$"
 )
 
 
@@ -30,7 +33,7 @@ def is_valid_instagram_url(url: str) -> bool:
     return bool(INSTAGRAM_REGEX.match(url))
 
 
-def base_cmd():
+def base_cmd() -> list:
     cmd = [
         "python", "-m", "yt_dlp",
         "--no-playlist",
@@ -38,13 +41,15 @@ def base_cmd():
         "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
         "--add-header", "Accept-Language:en-US,en;q=0.9",
     ]
+    # ffmpeg path explicitly set karo
+    if os.path.exists(FFMPEG_PATH):
+        cmd += ["--ffmpeg-location", FFMPEG_PATH]
     if os.path.exists(COOKIES_FILE):
         cmd += ["--cookies", COOKIES_FILE]
     return cmd
 
 
 def get_info(url: str) -> dict:
-    """Sirf metadata fetch karo — no download"""
     cmd = base_cmd() + ["--dump-json", url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -53,7 +58,7 @@ def get_info(url: str) -> dict:
 
     if result.returncode != 0:
         err = result.stderr.strip()
-        if "Private" in err or "login" in err.lower():
+        if "private" in err.lower() or "login" in err.lower():
             raise HTTPException(status_code=403, detail="Private reel ya cookies expire.")
         if "404" in err or "not found" in err.lower():
             raise HTTPException(status_code=404, detail="Reel nahi mili.")
@@ -68,24 +73,17 @@ def get_info(url: str) -> dict:
 
 
 def download_merged(url: str) -> str:
-    """
-    ffmpeg se video+audio merge karke ek MP4 file download karo.
-    Returns: path to merged MP4 file
-    """
     out_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.mp4")
-
     cmd = base_cmd() + [
-        # Best video + best audio, ffmpeg se merge
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "-o", out_path,
         url,
     ]
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Download timeout. Dobara try karo.")
+        raise HTTPException(status_code=504, detail="Download timeout.")
 
     if result.returncode != 0:
         err = result.stderr.strip()
@@ -97,110 +95,96 @@ def download_merged(url: str) -> str:
     return out_path
 
 
+def cleanup(path: str):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "message": "Insta Reel Downloader v3 🚀",
-        "cookies": "✅ Loaded" if os.path.exists(COOKIES_FILE) else "❌ Not found",
-        "endpoints": ["/dl", "/download", "/health"]
+        "version": "3.1.0",
+        "ffmpeg": os.path.exists(FFMPEG_PATH),
+        "cookies": os.path.exists(COOKIES_FILE),
+        "endpoints": ["/dl", "/download", "/health"],
     }
 
 
 @app.get("/dl")
 def get_reel_info(url: str = Query(...)):
-    """
-    Metadata + best single stream URL return karta hai (watch ke liye).
-    Note: Ye URL sirf video ya sirf audio ho sakta hai — watch ke liye theek hai.
-    Download ke liye /download use karo.
-    """
     url = url.split("?")[0].rstrip("/") + "/"
-
     if not is_valid_instagram_url(url):
         raise HTTPException(status_code=400, detail="Invalid Instagram URL.")
 
     data = get_info(url)
 
-    # Best available single-file URL (with audio) prefer karo
+    # Audio+video dono wala format prefer karo
     mp4_url = None
-
-    # Pehle check karo koi format hai jisme audio+video dono hain
-    formats = data.get("formats", [])
-    for fmt in reversed(formats):  # reversed = best quality pehle
+    for fmt in reversed(data.get("formats", [])):
         if fmt.get("acodec") != "none" and fmt.get("vcodec") != "none":
             mp4_url = fmt.get("url")
             break
-
-    # Fallback
     if not mp4_url:
         mp4_url = data.get("url")
 
     return {
-        "success": True,
-        "title": data.get("title", "Instagram Reel"),
-        "uploader": data.get("uploader"),
+        "success":     True,
+        "title":       data.get("title", "Instagram Reel"),
+        "uploader":    data.get("uploader"),
         "uploader_id": data.get("uploader_id"),
-        "thumbnail": data.get("thumbnail"),
-        "duration": data.get("duration"),
-        "view_count": data.get("view_count"),
-        "like_count": data.get("like_count"),
-        "mp4_url": mp4_url,
-        "note": "Watch ke liye mp4_url use karo. Sound ke saath download ke liye /download endpoint use karo."
+        "thumbnail":   data.get("thumbnail"),
+        "duration":    data.get("duration"),
+        "view_count":  data.get("view_count"),
+        "like_count":  data.get("like_count"),
+        "mp4_url":     mp4_url,
     }
 
 
 @app.get("/download")
-def download_with_audio(url: str = Query(...)):
-    """
-    Video + Audio merge karke complete MP4 file return karta hai.
-    ffmpeg use hota hai — thoda slow lekin sound included hoga.
-    """
+def download_with_audio(url: str = Query(...), background_tasks: BackgroundTasks = None):
     url = url.split("?")[0].rstrip("/") + "/"
-
     if not is_valid_instagram_url(url):
         raise HTTPException(status_code=400, detail="Invalid Instagram URL.")
 
-    # Pehle info lo for filename
-    data = get_info(url)
-    uploader = data.get("uploader", "reel") or "reel"
-    safe_name = re.sub(r'[^\w\-]', '_', uploader)
+    data     = get_info(url)
+    uploader = re.sub(r'[^\w\-]', '_', data.get("uploader", "reel") or "reel")
+    path     = download_merged(url)
 
-    # Download + merge
-    file_path = download_merged(url)
-
-    def cleanup_after_send():
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
+    background_tasks.add_task(cleanup, path)
 
     return FileResponse(
-        path=file_path,
+        path=path,
         media_type="video/mp4",
-        filename=f"{safe_name}.mp4",
-        background=None,
+        filename=f"{uploader}.mp4",
     )
 
 
 @app.get("/health")
 def health():
-    # Check yt-dlp
     try:
-        r = subprocess.run(["python", "-m", "yt_dlp", "--version"], capture_output=True, text=True)
-        ytdlp = r.stdout.strip()
+        v = subprocess.run(["python", "-m", "yt_dlp", "--version"], capture_output=True, text=True)
+        ytdlp = v.stdout.strip()
     except Exception:
         ytdlp = "NOT FOUND ❌"
 
-    # Check ffmpeg
-    try:
-        r2 = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-        ffmpeg = r2.stdout.split("\n")[0] if r2.returncode == 0 else "NOT FOUND ❌"
-    except Exception:
-        ffmpeg = "NOT FOUND ❌"
+    ffmpeg_ok = os.path.exists(FFMPEG_PATH)
+    if ffmpeg_ok:
+        try:
+            fv = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True)
+            ffmpeg = fv.stdout.split("\n")[0]
+        except Exception:
+            ffmpeg = "Error running ffmpeg"
+    else:
+        ffmpeg = f"NOT FOUND at {FFMPEG_PATH} ❌"
 
     return {
-        "status": "ok",
-        "yt_dlp": ytdlp,
-        "ffmpeg": ffmpeg,
-        "cookies": os.path.exists(COOKIES_FILE),
+        "status":   "ok",
+        "yt_dlp":   ytdlp,
+        "ffmpeg":   ffmpeg,
+        "cookies":  os.path.exists(COOKIES_FILE),
     }
